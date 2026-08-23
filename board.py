@@ -1,122 +1,94 @@
-"""ナンプレの盤面表現と候補計算。"""
+"""ナンプレの盤面表現(ビットマスクで候補を管理する)。"""
 
 import numpy as np
 
-# 一辺のマス数
 BOARD_SIZE = 9
-# エリア（3x3ブロック）の一辺のマス数
-BLOCK_SIZE = int(np.sqrt(BOARD_SIZE))
-# 1〜BOARD_SIZEの数字の集合
-ALL_NUMBERS = set(range(1, BOARD_SIZE + 1))
+BLOCK_SIZE = 3
+# 1〜9すべてが候補であることを表すビットマスク(0b111111111)
+FULL_MASK = (1 << BOARD_SIZE) - 1
+
+# 0〜FULL_MASKの各値について、立っているビット数(候補の数)を引けるようにした表
+POPCOUNT = [bin(mask).count("1") for mask in range(1 << BOARD_SIZE)]
 
 
-def parse_board(input_string):
-    """81桁の数字文字列を9x9のnumpy配列に変換する
-
-    Args:
-        input_string (str): 81桁の数字文字列（0は空マス）
-
-    Returns:
-        numpy.ndarray: 9x9の盤面
-    """
-    return np.array(
-        [
-            [int(input_string[BOARD_SIZE * row + col]) for col in range(BOARD_SIZE)]
-            for row in range(BOARD_SIZE)
-        ]
-    )
+def box_index(row, col):
+    """(row, col) が属するエリア(3x3ブロック)の番号を返す"""
+    return (row // BLOCK_SIZE) * BLOCK_SIZE + col // BLOCK_SIZE
 
 
-def get_column_candidates(board):
-    """各列でまだ使われていない数字の集合のリストを返す
+def iter_values(mask):
+    """ビットマスクに立っている候補を数字(1〜9)として1つずつ返す"""
+    while mask:
+        low_bit = mask & -mask
+        yield low_bit.bit_length()
+        mask ^= low_bit
+
+
+def parse_cells(input_string):
+    """81桁の数字文字列を、マスごとの数字が入ったフラットなリストに変換する
 
     Args:
-        board (numpy.ndarray): 数字のリスト
+        input_string (str): 81桁の数字文字列(0は空マス)
 
     Returns:
-        list: 各列の候補となる数字の集合が入ったリスト
+        list: 81個の数字が入ったリスト(行優先)
     """
-    return [ALL_NUMBERS - set(board[:, col]) for col in range(BOARD_SIZE)]
+    return [int(char) for char in input_string]
 
 
-def get_row_candidates(board):
-    """各行でまだ使われていない数字の集合のリストを返す
+class Board:
+    """ビットマスクで候補を管理する9x9ナンプレの盤面
 
-    Args:
-        board (numpy.ndarray): 数字のリスト
-
-    Returns:
-        list: 各行の候補となる数字の集合が入ったリスト
+    row_masks[row] のbit (v-1) が立っていれば、数字 v がまだその行に
+    置かれていないことを表す。col_masks・box_masksも同様。
     """
-    return [ALL_NUMBERS - set(board[row, :]) for row in range(BOARD_SIZE)]
 
+    def __init__(self, cells):
+        self.cells = cells
+        self.row_masks = [FULL_MASK] * BOARD_SIZE
+        self.col_masks = [FULL_MASK] * BOARD_SIZE
+        self.box_masks = [FULL_MASK] * BOARD_SIZE
+        for row in range(BOARD_SIZE):
+            for col in range(BOARD_SIZE):
+                value = cells[row * BOARD_SIZE + col]
+                if value != 0:
+                    self._clear_candidate(row, col, value)
 
-def get_area_candidates(board):
-    """各エリア（3x3）でまだ使われていない数字の集合のリストを返す
+    def _clear_candidate(self, row, col, value):
+        bit = 1 << (value - 1)
+        self.row_masks[row] &= ~bit
+        self.col_masks[col] &= ~bit
+        self.box_masks[box_index(row, col)] &= ~bit
 
-    Args:
-        board (numpy.ndarray): 数字のリスト
+    def _restore_candidate(self, row, col, value):
+        bit = 1 << (value - 1)
+        self.row_masks[row] |= bit
+        self.col_masks[col] |= bit
+        self.box_masks[box_index(row, col)] |= bit
 
-    Returns:
-        list of list: 各エリアの候補となる数字の集合が入ったリスト
-    """
-    return [
-        [
-            ALL_NUMBERS
-            - set(
-                board[
-                    block_row * BLOCK_SIZE : (block_row + 1) * BLOCK_SIZE,
-                    block_col * BLOCK_SIZE : (block_col + 1) * BLOCK_SIZE,
-                ].ravel()
-            )
-            for block_col in range(BLOCK_SIZE)
-        ]
-        for block_row in range(BLOCK_SIZE)
-    ]
+    def candidate_mask(self, row, col):
+        """(row, col) に置ける数字のビットマスクを返す"""
+        return (
+            self.row_masks[row]
+            & self.col_masks[col]
+            & self.box_masks[box_index(row, col)]
+        )
 
+    def assign(self, row, col, value):
+        """(row, col) に value を置く"""
+        self.cells[row * BOARD_SIZE + col] = value
+        self._clear_candidate(row, col, value)
 
-def get_cell_candidates(board, column_candidates, row_candidates, area_candidates):
-    """各マスの候補となる数字の集合が入ったリストを返す
+    def unassign(self, row, col, value):
+        """assign(row, col, value) を取り消す"""
+        self.cells[row * BOARD_SIZE + col] = 0
+        self._restore_candidate(row, col, value)
 
-    Args:
-        board (numpy.ndarray): 数字のリスト
-        column_candidates (list): 各列の候補となる数字の集合が入ったリスト
-        row_candidates (list): 各行の候補となる数字の集合が入ったリスト
-        area_candidates (list): 各エリアの候補となる数字の集合が入ったリスト
-
-    Returns:
-        list of list: 各マスの候補となる数字の集合が入ったリスト
-    """
-    cell_candidates = [[set() for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
-    for row in range(BOARD_SIZE):
-        for col in range(BOARD_SIZE):
-            if board[row][col] != 0:
-                continue
-            cell_candidates[row][col] = (
-                area_candidates[row // BLOCK_SIZE][col // BLOCK_SIZE]
-                & column_candidates[col]
-                & row_candidates[row]
-            )
-    return cell_candidates
-
-
-def is_valid_board(board):
-    """盤面が数独のルールを満たしているかどうかを判定する
-
-    Args:
-        board (numpy.ndarray): 数字のリスト
-
-    Returns:
-        bool: 正しければTrue、正しくなければFalse
-    """
-    for candidates in get_column_candidates(board):
-        if candidates:
-            return False
-    for candidates in get_row_candidates(board):
-        if candidates:
-            return False
-    for row in get_area_candidates(board):
-        for candidates in row:
-            if candidates:
-                return False
-    return True
+    def to_numpy(self):
+        """出力表示用に9x9のnumpy配列へ変換する"""
+        return np.array(
+            [
+                self.cells[row * BOARD_SIZE : (row + 1) * BOARD_SIZE]
+                for row in range(BOARD_SIZE)
+            ]
+        )

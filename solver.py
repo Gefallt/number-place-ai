@@ -1,176 +1,156 @@
-"""ナンプレの探索アルゴリズム。"""
+"""ナンプレの探索アルゴリズム(ビットマスク + 制約伝播)。
 
-from collections import defaultdict
-from copy import deepcopy
+セルの候補を9bitの整数(ビットマスク)で管理し、盤面は複製せずに
+in-placeで書き換えてバックトラックする(戻すときはBoard.unassignで
+undoする)。1回の呼び出しの中でnaked single・hidden singleが
+確定しなくなるまで確定処理を繰り返してから分岐することで、
+探索木そのものを小さくしている。
+"""
 
-import board as board_module
+from collections import defaultdict, namedtuple
+
 import reporting
+from board import BOARD_SIZE, POPCOUNT, box_index, iter_values
 
-BOARD_SIZE = board_module.BOARD_SIZE
-BLOCK_SIZE = board_module.BLOCK_SIZE
+ScanResult = namedtuple(
+    "ScanResult",
+    ["contradiction", "empties", "row_candidates", "col_candidates", "box_candidates"],
+)
+
+_CONTRADICTION = ScanResult(True, [], None, None, None)
 
 
-def solve_number_place(board, column_candidates, row_candidates, area_candidates):
-    """ナンプレを解く
+def solve(board):
+    """ナンプレを解く。見つかった解はすべて reporting 経由で出力する
+
+    呼び出し前後で board の状態は変化しない(この呼び出しで行った
+    assignはすべてunassignして返る)。
 
     Args:
-        board (numpy.ndarray): 数字のリスト
-        column_candidates (list): 各列の候補となる数字の集合が入ったリスト
-        row_candidates (list): 各行の候補となる数字の集合が入ったリスト
-        area_candidates (list): 各エリアの候補となる数字の集合が入ったリスト
+        board (board.Board): 盤面
     """
     reporting.solve_count += 1
-    # 各マスの候補となる数字の集合が入ったリストを取得
-    cell_candidates = deepcopy(
-        board_module.get_cell_candidates(
-            board, column_candidates, row_candidates, area_candidates
-        )
-    )
-    # まだ決定していない座標のリストを取得
-    undecided_cells = get_least_candidate_cells(cell_candidates)
+    assigned_here = []
 
-    # まだ決定していない座標がない場合、ナンプレが正しいかどうかを判定する
-    if len(undecided_cells) == 0:
-        if not board_module.is_valid_board(board):
+    while True:
+        scan = _scan(board)
+
+        if scan.contradiction:
+            _undo(board, assigned_here)
             reporting.invalid_count += 1
             return
-        reporting.output_answer(board)
-        return
 
-    # 候補が1つしかない座標のリストを取得
-    forced_cells = get_forced_cells(cell_candidates)
+        if not scan.empties:
+            reporting.output_answer(board.to_numpy())
+            _undo(board, assigned_here)
+            return
 
-    # 候補が1つしかない座標がある場合、その座標を埋めて再帰処理を行う
-    if len(forced_cells) > 0:
-        for value, col, row in forced_cells:
-            board[row][col] = value
-            column_candidates[col].discard(value)
-            row_candidates[row].discard(value)
-            area_candidates[row // BLOCK_SIZE][col // BLOCK_SIZE].discard(value)
-        solve_number_place(
-            deepcopy(board),
-            deepcopy(column_candidates),
-            deepcopy(row_candidates),
-            deepcopy(area_candidates),
-        )
-        return
+        forced = _collect_forced_cells(scan)
+        if forced is None:
+            _undo(board, assigned_here)
+            reporting.invalid_count += 1
+            return
+        if not forced:
+            break
 
-    # 候補が1つしかない座標がない場合、候補の中から1つ数字を選んで再帰処理を行う
-    row = undecided_cells[0] // BOARD_SIZE
-    col = undecided_cells[0] % BOARD_SIZE
+        for (row, col), value in forced.items():
+            board.assign(row, col, value)
+            assigned_here.append((row, col, value))
 
-    # 候補の中から1つ数字を選んで再帰処理を行う
-    for value in cell_candidates[row][col]:
-        board[row][col] = value
-        new_column_candidates = deepcopy(column_candidates)
-        new_column_candidates[col].discard(value)
-        new_row_candidates = deepcopy(row_candidates)
-        new_row_candidates[row].discard(value)
-        new_area_candidates = deepcopy(area_candidates)
-        new_area_candidates[row // BLOCK_SIZE][col // BLOCK_SIZE].discard(value)
-        solve_number_place(
-            deepcopy(board),
-            deepcopy(new_column_candidates),
-            deepcopy(new_row_candidates),
-            deepcopy(new_area_candidates),
-        )
+    # 確定処理だけでは埋まらなかったので、候補が最小のマスで1つずつ試す
+    row, col, mask, _ = min(scan.empties, key=lambda cell: cell[3])
+    for value in iter_values(mask):
+        board.assign(row, col, value)
+        solve(board)
+        board.unassign(row, col, value)
+
+    _undo(board, assigned_here)
 
 
-def get_least_candidate_cells(cell_candidates):
-    """各マスの候補となる数字の集合の数が最小となるマスの座標のリストを返す
-    座標のリストは、行番号 * BOARD_SIZE + 列番号で表す
+def _undo(board, assigned_cells):
+    for row, col, value in reversed(assigned_cells):
+        board.unassign(row, col, value)
 
-    Args:
-        cell_candidates (list of list): 各マスの候補となる数字の集合が入ったリスト
 
-    Returns:
-        list: 各マスの候補となる数字の集合の数が最小となるマスの座標のリスト
+def _scan(board):
+    """空きマスの候補と、行・列・エリアごとに「その数字が置けるマス」を集計する
+
+    まだ置かれていない数字なのに置けるマスが1つもないユニットがあれば、
+    その時点で矛盾として検出する。
     """
-    cells_by_candidate_count = defaultdict(list)
+    empties = []
+    row_candidates = [defaultdict(list) for _ in range(BOARD_SIZE)]
+    col_candidates = [defaultdict(list) for _ in range(BOARD_SIZE)]
+    box_candidates = [defaultdict(list) for _ in range(BOARD_SIZE)]
+
     for row in range(BOARD_SIZE):
         for col in range(BOARD_SIZE):
-            candidate_count = len(cell_candidates[row][col])
-            if candidate_count == 0:
+            if board.cells[row * BOARD_SIZE + col] != 0:
                 continue
-            cells_by_candidate_count[candidate_count].append(row * BOARD_SIZE + col)
-    if not cells_by_candidate_count:
-        return []
-    return cells_by_candidate_count[min(cells_by_candidate_count.keys())]
+            mask = board.candidate_mask(row, col)
+            if mask == 0:
+                return _CONTRADICTION
+            empties.append((row, col, mask, POPCOUNT[mask]))
+            box = box_index(row, col)
+            for value in iter_values(mask):
+                row_candidates[row][value].append(col)
+                col_candidates[col][value].append(row)
+                box_candidates[box][value].append((row, col))
+
+    if (
+        _has_unplaceable_value(board.row_masks, row_candidates)
+        or _has_unplaceable_value(board.col_masks, col_candidates)
+        or _has_unplaceable_value(board.box_masks, box_candidates)
+    ):
+        return _CONTRADICTION
+
+    return ScanResult(False, empties, row_candidates, col_candidates, box_candidates)
 
 
-def get_forced_cells(cell_candidates):
-    """候補が1つしかない座標のリストを返却する
+def _has_unplaceable_value(unit_masks, unit_candidates):
+    """まだ置かれていない数字なのに、置けるマスがないユニットがあるかを調べる"""
+    for unit_mask, candidates in zip(unit_masks, unit_candidates):
+        for value in iter_values(unit_mask):
+            if not candidates.get(value):
+                return True
+    return False
 
-    Args:
-        cell_candidates (list of list): 各マスの候補となる数字の集合が入ったリスト
+
+def _collect_forced_cells(scan):
+    """naked single・hidden singleで確定するマスを集める
 
     Returns:
-        list: 候補が1つしかない座標の [数字, 列, 行] のリスト
+        dict または None: {(row, col): value} の辞書。
+        異なる確定処理が同じマスに違う値を要求した場合(矛盾)はNoneを返す
     """
-    forced_cells = []
+    forced = {}
 
-    # そもそも1つしか入らない枠が既に確定しているのであれば入れてしまう
+    def stage(row, col, value):
+        key = (row, col)
+        if key in forced and forced[key] != value:
+            return False
+        forced[key] = value
+        return True
+
+    for row, col, mask, count in scan.empties:
+        if count == 1:
+            value = next(iter_values(mask))
+            if not stage(row, col, value):
+                return None
+
     for row in range(BOARD_SIZE):
-        for col in range(BOARD_SIZE):
-            if len(cell_candidates[row][col]) != 1:
-                continue
-            value = next(iter(cell_candidates[row][col]))
-            cell = [value, col, row]
-            if cell not in forced_cells:
-                forced_cells.append(cell)
-
-    # rowの中で一意に決まったものがあればそれを返す
-    for row in range(BOARD_SIZE):
-        for value in range(1, BOARD_SIZE + 1):
-            found_col = -1
-            for col in range(BOARD_SIZE):
-                if value not in cell_candidates[row][col]:
-                    continue
-                if found_col >= 0:
-                    found_col = -1
-                    break
-                found_col = col
-            if found_col >= 0:
-                cell = [value, found_col, row]
-                if cell not in forced_cells:
-                    forced_cells.append(cell)
-
-    # colの中で一意に決まったものがあればそれを返す
+        for value, cols in scan.row_candidates[row].items():
+            if len(cols) == 1 and not stage(row, cols[0], value):
+                return None
     for col in range(BOARD_SIZE):
-        for value in range(1, BOARD_SIZE + 1):
-            found_row = -1
-            for row in range(BOARD_SIZE):
-                if value not in cell_candidates[row][col]:
-                    continue
-                if found_row >= 0:
-                    found_row = -1
-                    break
-                found_row = row
-            if found_row >= 0:
-                cell = [value, col, found_row]
-                if cell not in forced_cells:
-                    forced_cells.append(cell)
+        for value, rows in scan.col_candidates[col].items():
+            if len(rows) == 1 and not stage(rows[0], col, value):
+                return None
+    for box in range(BOARD_SIZE):
+        for value, cells in scan.box_candidates[box].items():
+            if len(cells) == 1:
+                row, col = cells[0]
+                if not stage(row, col, value):
+                    return None
 
-    # areaの中で一意に決まったものがあればそれを返す
-    for area_row_start in range(0, BOARD_SIZE, BLOCK_SIZE):
-        for area_col_start in range(0, BOARD_SIZE, BLOCK_SIZE):
-            for value in range(1, BOARD_SIZE + 1):
-                found_offset = -1
-                for offset in range(BOARD_SIZE):
-                    row = area_row_start + offset // BLOCK_SIZE
-                    col = area_col_start + offset % BLOCK_SIZE
-                    if value not in cell_candidates[row][col]:
-                        continue
-                    if found_offset >= 0:
-                        found_offset = -1
-                        break
-                    found_offset = offset
-                if found_offset >= 0:
-                    cell = [
-                        value,
-                        area_col_start + found_offset % BLOCK_SIZE,
-                        area_row_start + found_offset // BLOCK_SIZE,
-                    ]
-                    if cell not in forced_cells:
-                        forced_cells.append(cell)
-    return forced_cells
+    return forced
