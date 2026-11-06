@@ -6,6 +6,7 @@ from board import Board, parse_cells
 
 
 def main():
+    print("INPUT(n81)")
     # ナンプレの問題が入った81桁の文字列を入力
     input_string = input()
 
